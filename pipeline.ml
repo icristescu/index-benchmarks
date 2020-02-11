@@ -24,6 +24,7 @@ let merge_json metadata json =
   Yojson.Basic.to_string
     (`Assoc [ ("metadata", `String metadata); ("result", `String json) ])
 
+(* Get the number of files, to number the next file in the directory. *)
 let num_file_dir path =
   let dir_handle = Unix.opendir path in
   let rec loop acc =
@@ -36,14 +37,15 @@ let num_file_dir path =
   let () = Unix.closedir dir_handle in
   num
 
+(* Create a file where the benchmarks should be written. Path is "<repo>/<commit>/<run>.json" *)
 let create_tmp_host repo commit_hash =
   let path = "/data/tmp/" ^ repo in
   let () =
-    if not (Sys.file_exists path) then try Unix.mkdir path 0o666 with _ -> ()
+    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
   in
   let path = path ^ "/" ^ commit_hash in
   let () =
-    if not (Sys.file_exists path) then try Unix.mkdir path 0o666 with _ -> ()
+    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
   in
   let files = num_file_dir path in
   let file_name = string_of_int files in
@@ -78,7 +80,7 @@ let dockerfile ~base =
   @@ run "opam config exec -- dune build @@default bench/bench.exe"
   @@ run "eval $(opam env)"
 
-let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
+let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 1) ()
 
 let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
     ?docker_numa_node ~docker_shm_size ~num_reruns () =
@@ -115,12 +117,16 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
           Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dG" docker_shm_size;
         ]
   in
-  let compute_benchmarks acc =
+  let compute_benchmarks :
+      (Fpath.t * string) option list Current.t ->
+      (Fpath.t * string) option list Current.t =
+   fun acc ->
     let tmp_host = create_tmp_host repo_name commit in
     let tmp_container =
       Fpath.(v ("/data/tmp/" ^ repo_name ^ "/" ^ commit) / filename tmp_host)
     in
-    let s =
+    let* acc = acc in
+    let* s =
       let run_args =
         [
           "--security-opt";
@@ -163,10 +169,9 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
       | None -> None
     in
     let acc = [ s ] @ acc in
-    acc
+    Current.return acc
   in
-  Sequential.repeat num_reruns compute_benchmarks []
-  |> Current.list_seq
+  Sequential.repeat num_reruns compute_benchmarks (Current.return [])
   |> Current.list_map ~pp:pretty_print
        (Current.option_map (fun p ->
             Current.component "post"
