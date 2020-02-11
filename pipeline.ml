@@ -120,13 +120,13 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
   let compute_benchmarks :
       (Fpath.t * string) option list Current.t ->
       (Fpath.t * string) option list Current.t =
-   fun acc ->
+   fun pipeline_that_contains_an_acc ->
     let tmp_host = create_tmp_host repo_name commit in
     let tmp_container =
       Fpath.(v ("/data/tmp/" ^ repo_name ^ "/" ^ commit) / filename tmp_host)
     in
-    let* acc = acc in
-    let* s =
+    let+ acc = pipeline_that_contains_an_acc
+    and+ s =
       let run_args =
         [
           "--security-opt";
@@ -169,7 +169,7 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
       | None -> None
     in
     let acc = [ s ] @ acc in
-    Current.return acc
+    acc
   in
   Sequential.repeat num_reruns compute_benchmarks (Current.return [])
   |> Current.list_map ~pp:pretty_print
