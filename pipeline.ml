@@ -7,28 +7,18 @@ module Github = Current_github
 module Docker = Current_docker.Default
 module Slack = Current_slack
 
+module Sequential : sig
+  val repeat : int -> ('a -> 'a) -> 'a -> 'a
+end = struct
+  let rec repeat n f x = match n with 0 -> x | n -> repeat (n - 1) f (f x)
+end
+
 let pool = Current.Pool.create ~label:"docker" 1
 
 let read_fpath p = Bos.OS.File.read p |> Rresult.R.error_msg_to_invalid_arg
 
 let read_channel_uri p =
   read_fpath p |> String.trim |> Uri.of_string |> Current_slack.channel
-
-(* Generate a Dockerfile for building all the opam packages in the build context. *)
-let dockerfile ~base =
-  let open Dockerfile in
-  from (Docker.Image.hash base)
-  @@ run
-       "sudo apt-get install -qq -yy libffi-dev liblmdb-dev m4 pkg-config \
-        gnuplot-x11"
-  @@ copy ~src:[ "--chown=opam:opam ." ] ~dst:"index" ()
-  @@ workdir "index"
-  @@ run "opam install -y --deps-only -t ."
-  @@ add ~src:[ "--chown=opam ." ] ~dst:"." ()
-  @@ run "opam config exec -- dune build @@default bench/bench.exe"
-  @@ run "eval $(opam env)"
-
-let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let merge_json metadata json =
   Yojson.Basic.to_string
@@ -49,11 +39,11 @@ let num_file_dir path =
 let create_tmp_host repo commit_hash =
   let path = "/data/tmp/" ^ repo in
   let () =
-    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
+    if not (Sys.file_exists path) then try Unix.mkdir path 0o666 with _ -> ()
   in
   let path = path ^ "/" ^ commit_hash in
   let () =
-    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
+    if not (Sys.file_exists path) then try Unix.mkdir path 0o666 with _ -> ()
   in
   let files = num_file_dir path in
   let file_name = string_of_int files in
@@ -66,21 +56,35 @@ let create_tmp_host repo commit_hash =
 let get_commit github repo =
   let head = Github.Api.head_commit github repo in
   let+ commit = head in
-  let repo_name = repo.name in
-  let tmp_host = create_tmp_host repo_name (Github.Api.Commit.hash commit) in
-  tmp_host
+  Github.Api.Commit.hash commit
+
+let pretty_print f key =
+  let label =
+    match key with Some (x, _) -> Fpath.filename x | None -> "None"
+  in
+  Fmt.pf f "%s" label
+
+(* Generate a Dockerfile for building all the opam packages in the build context. *)
+let dockerfile ~base =
+  let open Dockerfile in
+  from (Docker.Image.hash base)
+  @@ run
+       "sudo apt-get install -qq -yy libffi-dev liblmdb-dev m4 pkg-config \
+        gnuplot-x11"
+  @@ copy ~src:[ "--chown=opam:opam ." ] ~dst:"index" ()
+  @@ workdir "index"
+  @@ run "opam install -y --deps-only -t ."
+  @@ add ~src:[ "--chown=opam ." ] ~dst:"." ()
+  @@ run "opam config exec -- dune build @@default bench/bench.exe"
+  @@ run "eval $(opam env)"
+
+let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-    ?docker_numa_node ~docker_shm_size () =
+    ?docker_numa_node ~docker_shm_size ~num_reruns () =
   let head = Github.Api.head_commit github repo in
   let repo_name = repo.name in
-  let commit = get_commit github repo in
-  let tmp_host = create_tmp_host repo_name (Github.Api.Commit.hash commit) in
-  let tmp_container = Fpath.(v "/data/tmp/" / filename tmp_host) in
-  let () =
-    let oc = open_out (Fpath.filename tmp_host) in
-    close_out oc
-  in
+  let* commit = get_commit github repo in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocaml/opam2" in
@@ -111,68 +115,74 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
           Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dG" docker_shm_size;
         ]
   in
-  let s =
-    let run_args =
-      [
-        "--security-opt";
-        "seccomp=./aslr_seccomp.json";
-        "--mount";
-        Fmt.str "type=bind,source=%a,target=%a" Fpath.pp tmp_container Fpath.pp
-          tmp_host;
-      ]
-      @ tmpfs
-      @ docker_cpuset_cpus
-      @ docker_cpuset_mems
+  let compute_benchmarks acc =
+    let tmp_host = create_tmp_host repo_name commit in
+    let tmp_container =
+      Fpath.(v ("/data/tmp/" ^ repo_name ^ "/" ^ commit) / filename tmp_host)
     in
-    let+ () =
-      Docker.run ~run_args image
-        ~args:
-          [
-            "/usr/bin/setarch";
-            "x86_64";
-            "--addr-no-randomize";
-            "_build/default/bench/bench.exe";
-            "-d";
-            "/dev/shm";
-            "--json";
-            "--output";
-            Fmt.str "%a" Fpath.pp tmp_container;
-          ]
+    let s =
+      let run_args =
+        [
+          "--security-opt";
+          "seccomp=./aslr_seccomp.json";
+          "--mount";
+          Fmt.str "type=bind,source=%a,target=%a" Fpath.pp tmp_container
+            Fpath.pp tmp_host;
+        ]
+        @ tmpfs
+        @ docker_cpuset_cpus
+        @ docker_cpuset_mems
+      in
+      let+ () =
+        Docker.run ~run_args image
+          ~args:
+            [
+              "/usr/bin/setarch";
+              "x86_64";
+              "--addr-no-randomize";
+              "_build/default/bench/bench.exe";
+              "-d";
+              "/dev/shm";
+              "--json";
+              "--output";
+              Fmt.str "%a" Fpath.pp tmp_container;
+            ]
+      in
+      (* Conditionally move the results to ?output_file *)
+      let results_path =
+        match output_file with
+        | Some path ->
+            Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
+            path
+        | None -> tmp_host
+      in
+      (* No need to read JSON if we're not publishing the results anywhere *)
+      match slack_path with
+      | Some p ->
+          Some (p, merge_json (repo_name ^ commit) (read_fpath results_path))
+      | None -> None
     in
-    (* Conditionally move the results to ?output_file *)
-    let results_path =
-      match output_file with
-      | Some path ->
-          Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
-          path
-      | None -> tmp_host
-    in
-    (* No need to read JSON if we're not publishing the results anywhere *)
-    match slack_path with
-    | Some p ->
-        Some
-          ( p,
-            merge_json
-              (repo_name ^ Github.Api.Commit.hash commit)
-              (read_fpath results_path) )
-    | None -> None
+    let acc = [ s ] @ acc in
+    acc
   in
-  s
-  |> Current.option_map (fun p ->
-         Current.component "post"
-         |> let** path, _ = p in
-            let channel = read_channel_uri path in
-            Slack.post channel ~key:"output" (Current.map snd p))
+  Sequential.repeat num_reruns compute_benchmarks []
+  |> Current.list_seq
+  |> Current.list_map ~pp:pretty_print
+       (Current.option_map (fun p ->
+            Current.component "post"
+            |> let** path, _ = p in
+               let channel = read_channel_uri path in
+               Slack.post channel ~key:"output" (Current.map snd p)))
   |> Current.ignore_value
 
 let webhooks = [ ("github", Github.input_webhook) ]
 
 let main config mode github repo output_file slack_path docker_cpu
-    docker_numa_node docker_shm_size () =
+    docker_numa_node docker_shm_size num_reruns () =
   let engine =
     Current.Engine.create ~config
       (pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-         ?docker_numa_node ~docker_shm_size)
+         ?docker_numa_node ~docker_shm_size ~num_reruns)
   in
   Logging.run
     (Lwt.choose
@@ -209,6 +219,10 @@ let docker_shm_size =
   let doc = "Size of tmpfs volume to be mounted in /dev/shm (in GB)." in
   Arg.(value & opt int 4 & info [ "docker-shm-size" ] ~doc)
 
+let num_reruns =
+  let doc = "Number of benchmark reruns" in
+  Arg.(value & opt int 1 & info [ "num_reruns" ] ~doc)
+
 let repo =
   Arg.required
   @@ Arg.pos 0 (Arg.some Github.Repo_id.cmdliner) None
@@ -232,6 +246,7 @@ let cmd =
       $ docker_cpu
       $ docker_numa_node
       $ docker_shm_size
+      $ num_reruns
       $ setup_log),
     Term.info "github" ~doc )
 
