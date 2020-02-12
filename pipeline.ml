@@ -8,9 +8,24 @@ module Docker = Current_docker.Default
 module Slack = Current_slack
 
 module Sequential : sig
-  val repeat : int -> ('a -> 'a) -> 'a -> 'a
+  val repeat :
+    int -> ('a Current.t -> 'a Current.t) -> 'a Current.t -> 'a Current.t
 end = struct
-  let rec repeat n f x = match n with 0 -> x | n -> repeat (n - 1) f (f x)
+  (* let sequence :
+   *     ('a Current.t -> 'a Current.t) ->
+   *     ('a Current.t -> 'a Current.t) ->
+   *     'a Current.t ->
+   *     'a Current.t =
+   *  fun p1 p2 a ->
+   *   let p1_output = p1 a in
+   *   p2 p1_output *)
+
+  let rec repeat n f x =
+    match n with
+    | 0 -> x
+    | n ->
+        let next_x = f x in
+        repeat (n - 1) f next_x
 end
 
 let pool = Current.Pool.create ~label:"docker" 1
@@ -24,47 +39,47 @@ let merge_json metadata json =
   Yojson.Basic.to_string
     (`Assoc [ ("metadata", `String metadata); ("result", `String json) ])
 
-(* Get the number of files, to number the next file in the directory. *)
-let num_file_dir path =
-  let dir_handle = Unix.opendir path in
-  let rec loop acc =
-    try
-      let _ = Unix.readdir dir_handle in
-      loop (acc + 1)
-    with End_of_file -> acc
-  in
-  let num = loop 0 in
-  let () = Unix.closedir dir_handle in
-  num
+(* (\* Get the number of files, to number the next file in the directory. *\)
+ * let num_file_dir path =
+ *   let dir_handle = Unix.opendir path in
+ *   let rec loop acc =
+ *     try
+ *       let _ = Unix.readdir dir_handle in
+ *       loop (acc + 1)
+ *     with End_of_file -> acc
+ *   in
+ *   let num = loop 0 in
+ *   let () = Unix.closedir dir_handle in
+ *   num *)
 
-(* Create a file where the benchmarks should be written. Path is "<repo>/<commit>/<run>.json" *)
-let create_tmp_host repo commit_hash =
-  let path = "/data/tmp/" ^ repo in
-  let () =
-    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
-  in
-  let path = path ^ "/" ^ commit_hash in
-  let () =
-    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
-  in
-  let files = num_file_dir path in
-  let file_name = string_of_int files in
-  let path = path ^ "/" ^ file_name ^ ".json" in
-  let oc = open_out path in
-  let () = Unix.chmod path 0o666 in
-  let () = close_out oc in
-  Fpath.(v path)
+(* (\* Create a file where the benchmarks should be written. Path is "<repo>/<commit>/<run>.json" *\)
+ * let create_tmp_host repo commit_hash =
+ *   let path = "/data/tmp/" ^ repo in
+ *   let () =
+ *     if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
+ *   in
+ *   let path = path ^ "/" ^ commit_hash in
+ *   let () =
+ *     if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
+ *   in
+ *   let files = num_file_dir path in
+ *   let file_name = string_of_int files in
+ *   let path = path ^ "/" ^ file_name ^ ".json" in
+ *   let oc = open_out path in
+ *   let () = Unix.chmod path 0o666 in
+ *   let () = close_out oc in
+ *   Fpath.(v path) *)
 
 let get_commit github repo =
   let head = Github.Api.head_commit github repo in
   let+ commit = head in
   Github.Api.Commit.hash commit
 
-let pretty_print f key =
-  let label =
-    match key with Some (x, _) -> Fpath.filename x | None -> "None"
-  in
-  Fmt.pf f "%s" label
+(* let pretty_print f key =
+ *   let label =
+ *     match key with Some (x, _) -> Fpath.filename x | None -> "None"
+ *   in
+ *   Fmt.pf f "%s" label *)
 
 (* Generate a Dockerfile for building all the opam packages in the build context. *)
 let dockerfile ~base =
@@ -80,7 +95,70 @@ let dockerfile ~base =
   @@ run "opam config exec -- dune build @@default bench/bench.exe"
   @@ run "eval $(opam env)"
 
+let tmp_host =
+  Bos.OS.File.tmp ~mode:0o666
+    ~dir:Fpath.(v "/data/tmp/")
+    "index-bench-result-%s.txt"
+  |> Rresult.R.error_msg_to_invalid_arg
+
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 1) ()
+
+let post_to_slack p =
+  Current.component "post"
+  |> let** path, _ = p in
+     let channel = read_channel_uri path in
+     Slack.post channel ~key:"output" (Current.map snd p)
+
+let compute_benchmarks ~image ~repo_name ~commit ~tmpfs ~docker_cpuset_cpus
+    ~docker_cpuset_mems ~output_file ~slack_path acc =
+  let tmp_container = Fpath.(v "/data/tmp/" / filename tmp_host) in
+  let+ acc = acc
+  and+ s =
+    let run_args =
+      [
+        "--security-opt";
+        "seccomp=./aslr_seccomp.json";
+        "--mount";
+        Fmt.str "type=bind,source=%a,target=%a" Fpath.pp tmp_container Fpath.pp
+          tmp_host;
+      ]
+      @ tmpfs
+      @ docker_cpuset_cpus
+      @ docker_cpuset_mems
+    in
+    let+ () =
+      Docker.run ~label:"run benchmarks" ~run_args image
+        ~args:
+          [
+            "/usr/bin/setarch";
+            "x86_64";
+            "--addr-no-randomize";
+            "_build/default/bench/bench.exe";
+            "-d";
+            "/dev/shm";
+            "--nb-entries";
+            "1000";
+            "--json";
+            "--output";
+            Fmt.str "%a" Fpath.pp tmp_container;
+          ]
+    in
+    (* Conditionally move the results to ?output_file *)
+    let results_path =
+      match output_file with
+      | Some path ->
+          Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
+          path
+      | None -> tmp_host
+    in
+    (* No need to read JSON if we're not publishing the results anywhere *)
+    match slack_path with
+    | Some p ->
+        Some (p, merge_json (repo_name ^ commit) (read_fpath results_path))
+    | None -> None
+  in
+  let acc = [ s ] @ acc in
+  acc
 
 let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
     ?docker_numa_node ~docker_shm_size ~num_reruns () =
@@ -117,67 +195,10 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
           Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dG" docker_shm_size;
         ]
   in
-  let compute_benchmarks :
-      (Fpath.t * string) option list Current.t ->
-      (Fpath.t * string) option list Current.t =
-   fun pipeline_that_contains_an_acc ->
-    let tmp_host = create_tmp_host repo_name commit in
-    let tmp_container =
-      Fpath.(v ("/data/tmp/" ^ repo_name ^ "/" ^ commit) / filename tmp_host)
-    in
-    let+ acc = pipeline_that_contains_an_acc
-    and+ s =
-      let run_args =
-        [
-          "--security-opt";
-          "seccomp=./aslr_seccomp.json";
-          "--mount";
-          Fmt.str "type=bind,source=%a,target=%a" Fpath.pp tmp_container
-            Fpath.pp tmp_host;
-        ]
-        @ tmpfs
-        @ docker_cpuset_cpus
-        @ docker_cpuset_mems
-      in
-      let+ () =
-        Docker.run ~run_args image
-          ~args:
-            [
-              "/usr/bin/setarch";
-              "x86_64";
-              "--addr-no-randomize";
-              "_build/default/bench/bench.exe";
-              "-d";
-              "/dev/shm";
-              "--json";
-              "--output";
-              Fmt.str "%a" Fpath.pp tmp_container;
-            ]
-      in
-      (* Conditionally move the results to ?output_file *)
-      let results_path =
-        match output_file with
-        | Some path ->
-            Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
-            path
-        | None -> tmp_host
-      in
-      (* No need to read JSON if we're not publishing the results anywhere *)
-      match slack_path with
-      | Some p ->
-          Some (p, merge_json (repo_name ^ commit) (read_fpath results_path))
-      | None -> None
-    in
-    let acc = [ s ] @ acc in
-    acc
-  in
-  Sequential.repeat num_reruns compute_benchmarks (Current.return [])
-  |> Current.list_map ~pp:pretty_print
-       (Current.option_map (fun p ->
-            Current.component "post"
-            |> let** path, _ = p in
-               let channel = read_channel_uri path in
-               Slack.post channel ~key:"output" (Current.map snd p)))
+  Sequential.repeat num_reruns
+    (compute_benchmarks ~image ~repo_name ~commit ~tmpfs ~docker_cpuset_cpus
+       ~docker_cpuset_mems ~output_file ~slack_path)
+    (Current.return [])
   |> Current.ignore_value
 
 let webhooks = [ ("github", Github.input_webhook) ]
