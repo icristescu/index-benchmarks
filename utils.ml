@@ -53,6 +53,11 @@ let create_tmp_host repo commit_hash =
   Fpath.(v path)
 
 let merge_json repo commit json =
-  Yojson.Basic.pretty_to_string
+  Yojson.Safe.pretty_to_string
     (`Assoc
       [ ("repo", `String repo); ("commit", `String commit); ("result", json) ])
+
+let get_last_bench_filepath repo commit =
+  let dir_path = "/data/tmp/" ^ repo ^ "/" ^ commit in
+  let curr_number = num_file_dir dir_path in
+  dir_path ^ "/" ^ string_of_int (curr_number - 1) ^ ".json"

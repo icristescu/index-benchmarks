@@ -29,7 +29,8 @@ let dockerfile ~base =
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-    ?docker_numa_node ~docker_shm_size ~tmp_host ~tmp_container () =
+    ?docker_numa_node ~docker_shm_size ~tmp_host ~tmp_container ~last_benchmark
+    () =
   let head = Github.Api.head_commit github repo in
   let commit = Utils.get_commit repo.name repo.owner in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
@@ -98,12 +99,16 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
           path
       | None -> tmp_host
     in
+    let diff =
+      Utils.merge_json repo.name commit
+        (Diff.generate_diff (Fpath.filename results_path) last_benchmark)
+    in
     let content =
       Utils.merge_json repo.name commit
-        (Yojson.Basic.from_string (Utils.read_fpath results_path))
+        (Yojson.Safe.from_string (Utils.read_fpath results_path))
     in
     let () = Utils.write_fpath results_path content in
-    match slack_path with Some p -> Some (p, content) | None -> None
+    match slack_path with Some p -> Some (p, diff) | None -> None
   in
   s
   |> Current.option_map (fun p ->
@@ -122,10 +127,12 @@ let main config mode github (repo : Current_github.Repo_id.t) output_file
   let tmp_container =
     Fpath.(v ("/data/tmp/" ^ repo.name ^ "/" ^ commit) / filename tmp_host)
   in
+  let last_benchmark = Utils.get_last_bench_filepath repo.name commit in
   let engine =
     Current.Engine.create ~config
       (pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-         ?docker_numa_node ~docker_shm_size ~tmp_host ~tmp_container)
+         ?docker_numa_node ~docker_shm_size ~tmp_host ~tmp_container
+         ~last_benchmark)
   in
   Logging.run
     (Lwt.choose
