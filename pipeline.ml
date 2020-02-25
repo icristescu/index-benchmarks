@@ -29,8 +29,8 @@ let dockerfile ~base =
 
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
-let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-    ?docker_numa_node ~docker_shm_size ~tmp_host ~tmp_container () =
+let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
+    ~docker_shm_size ~tmp_host ~tmp_container () =
   let head = Github.Api.head_commit github repo in
   let commit = Utils.get_commit repo.name repo.owner in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
@@ -91,28 +91,13 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
             Fmt.str "%a" Fpath.pp tmp_container;
           ]
     in
-    (* Conditionally move the results to ?output_file *)
-    let results_path =
-      match output_file with
-      | Some path ->
-          Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
-          path
-      | None -> tmp_host
-    in
     let content =
       Utils.merge_json repo.name commit
-        (Yojson.Basic.from_string (Utils.read_fpath results_path))
+        (Yojson.Basic.from_string (Utils.read_fpath tmp_host))
     in
     content
   in
-  let results_path =
-    match output_file with
-    | Some path ->
-        Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
-        path
-    | None -> tmp_host
-  in
-  let file_path = Current.return results_path in
+  let file_path = Current.return tmp_host in
   let* () = FS.save file_path s in
   match slack_path with
   | Some p ->
@@ -122,8 +107,8 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
 
 let webhooks = [ ("github", Github.input_webhook) ]
 
-let main config mode github (repo : Current_github.Repo_id.t) output_file
-    slack_path docker_cpu docker_numa_node docker_shm_size () =
+let main config mode github (repo : Current_github.Repo_id.t) slack_path
+    docker_cpu docker_numa_node docker_shm_size () =
   let commit = Utils.get_commit repo.name repo.owner in
   let tmp_host = Utils.create_tmp_host repo.name commit in
   let tmp_container =
@@ -131,8 +116,8 @@ let main config mode github (repo : Current_github.Repo_id.t) output_file
   in
   let engine =
     Current.Engine.create ~config
-      (pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-         ?docker_numa_node ~docker_shm_size ~tmp_host ~tmp_container)
+      (pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
+         ~docker_shm_size ~tmp_host ~tmp_container)
   in
   Logging.run
     (Lwt.choose
@@ -143,10 +128,6 @@ let main config mode github (repo : Current_github.Repo_id.t) output_file
 open Cmdliner
 
 let path = Arg.conv ~docv:"PATH" Fpath.(of_string, pp)
-
-let output_file =
-  let doc = "Output file where benchmark result should be stored." in
-  Arg.(value & opt (some path) None & info [ "o"; "output" ] ~doc)
 
 let slack_path =
   let doc =
@@ -187,7 +168,6 @@ let cmd =
       $ Current_web.cmdliner
       $ Current_github.Api.cmdliner
       $ repo
-      $ output_file
       $ slack_path
       $ docker_cpu
       $ docker_numa_node
