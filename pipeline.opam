@@ -14,6 +14,7 @@ depends: [
   "cmdliner"
   "current"
   "current_docker"
+  "current_fs"
   "current_git"
   "current_github"
   "current_rpc"
@@ -50,4 +51,5 @@ pin-depends: [
   [ "current_rpc.dev" "git+https://github.com/ocurrent/ocurrent#3a190f0c388b51957c4afbebafd4e8d63717f384" ]
   [ "current_slack.dev" "git+https://github.com/ocurrent/ocurrent#3a190f0c388b51957c4afbebafd4e8d63717f384" ]
   [ "current_web.dev" "git+https://github.com/ocurrent/ocurrent#3a190f0c388b51957c4afbebafd4e8d63717f384" ]
+  [ "current_fs.dev" "git+https://github.com/ocurrent/ocurrent#3a190f0c388b51957c4afbebafd4e8d63717f384" ]
 ]

@@ -6,6 +6,7 @@ module Git = Current_git
 module Github = Current_github
 module Docker = Current_docker.Default
 module Slack = Current_slack
+module FS = Current_fs
 
 let pool = Current.Pool.create ~label:"docker" 1
 
@@ -17,8 +18,8 @@ let dockerfile ~base =
   let open Dockerfile in
   from (Docker.Image.hash base)
   @@ run
-       "sudo apt-get install -qq -yy libffi-dev liblmdb-dev m4 pkg-config \
-        gnuplot-x11"
+       "sudo apt-get install -qq -yy --fix-missing libffi-dev liblmdb-dev m4 \
+        pkg-config gnuplot-x11"
   @@ copy ~src:[ "--chown=opam:opam ." ] ~dst:"index" ()
   @@ workdir "index"
   @@ run "opam install -y --deps-only -t ."
@@ -102,16 +103,22 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
       Utils.merge_json repo.name commit
         (Yojson.Basic.from_string (Utils.read_fpath results_path))
     in
-    let () = Utils.write_fpath results_path content in
-    match slack_path with Some p -> Some (p, content) | None -> None
+    content
   in
-  s
-  |> Current.option_map (fun p ->
-         Current.component "post"
-         |> let** path, _ = p in
-            let channel = read_channel_uri path in
-            Slack.post channel ~key:"output" (Current.map snd p))
-  |> Current.ignore_value
+  let results_path =
+    match output_file with
+    | Some path ->
+        Bos.OS.Path.move tmp_host path |> Rresult.R.error_msg_to_invalid_arg;
+        path
+    | None -> tmp_host
+  in
+  let file_path = Current.return results_path in
+  let* () = FS.save file_path s in
+  match slack_path with
+  | Some p ->
+      let channel = read_channel_uri p in
+      Slack.post channel ~key:"output" s
+  | None -> Current.return ()
 
 let webhooks = [ ("github", Github.input_webhook) ]
 
