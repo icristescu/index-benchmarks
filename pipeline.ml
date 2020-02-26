@@ -18,8 +18,8 @@ let dockerfile ~base =
   let open Dockerfile in
   from (Docker.Image.hash base)
   @@ run
-       "sudo apt-get install -qq -yy --fix-missing libffi-dev liblmdb-dev m4 \
-        pkg-config gnuplot-x11"
+       "sudo apt-get install -qq -yy libffi-dev liblmdb-dev m4 pkg-config \
+        gnuplot-x11"
   @@ copy ~src:[ "--chown=opam:opam ." ] ~dst:"index" ()
   @@ workdir "index"
   @@ run "opam install -y --deps-only -t ."
@@ -30,7 +30,7 @@ let dockerfile ~base =
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
-    ~docker_shm_size ~tmp_host ~tmp_container () =
+    ~docker_shm_size ~tmp_host ~tmp_container ~commit () =
   let head = Github.Api.head_commit github repo in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let dockerfile =
@@ -90,7 +90,10 @@ let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
             Fmt.str "%a" Fpath.pp tmp_container;
           ]
     in
-    let content = Utils.read_fpath tmp_host in
+    let content =
+      Utils.merge_json repo.name commit
+        (Yojson.Basic.from_string (Utils.read_fpath tmp_host))
+    in
     content
   in
   let file_path = Current.return tmp_host in
@@ -113,7 +116,7 @@ let main config mode github (repo : Current_github.Repo_id.t) slack_path
   let engine =
     Current.Engine.create ~config
       (pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
-         ~docker_shm_size ~tmp_host ~tmp_container)
+         ~docker_shm_size ~tmp_host ~tmp_container ~commit)
   in
   Logging.run
     (Lwt.choose
