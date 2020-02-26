@@ -32,7 +32,6 @@ let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
     ~docker_shm_size ~tmp_host ~tmp_container () =
   let head = Github.Api.head_commit github repo in
-  let commit = Utils.get_commit repo.name repo.owner in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocaml/opam2" in
@@ -91,10 +90,7 @@ let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
             Fmt.str "%a" Fpath.pp tmp_container;
           ]
     in
-    let content =
-      Utils.merge_json repo.name commit
-        (Yojson.Basic.from_string (Utils.read_fpath tmp_host))
-    in
+    let content = Utils.read_fpath tmp_host in
     content
   in
   let file_path = Current.return tmp_host in
