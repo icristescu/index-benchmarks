@@ -30,7 +30,8 @@ let dockerfile ~base =
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
-    ~docker_shm_size ~tmp_host ~tmp_container ~commit () =
+    ~docker_shm_size ~tmp_host ~tmp_container () =
+  let count = 0 in
   let head = Github.Api.head_commit github repo in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let dockerfile =
@@ -90,8 +91,9 @@ let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
             Fmt.str "%a" Fpath.pp tmp_container;
           ]
     in
+    let count = count + 1 in
     let content =
-      Utils.merge_json repo.name commit
+      Utils.merge_json repo.name (string_of_int count)
         (Yojson.Basic.from_string (Utils.read_fpath tmp_host))
     in
     content
@@ -116,7 +118,7 @@ let main config mode github (repo : Current_github.Repo_id.t) slack_path
   let engine =
     Current.Engine.create ~config
       (pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
-         ~docker_shm_size ~tmp_host ~tmp_container ~commit)
+         ~docker_shm_size ~tmp_host ~tmp_container)
   in
   Logging.run
     (Lwt.choose
