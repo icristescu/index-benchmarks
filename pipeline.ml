@@ -34,7 +34,7 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocaml/opam2" in
-    dockerfile ~base
+    `Contents (dockerfile ~base)
   in
   let image = Docker.build ~pool ~pull:false ~dockerfile (`Git src) in
   let docker_cpuset_cpus =
@@ -88,6 +88,20 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
             "--output";
             Fmt.str "%a" Fpath.pp tmp_container;
           ]
+    and+ output =
+      Docker.pread image
+        ~args:
+          [
+            "/usr/bin/setarch";
+            "x86_64";
+            "--addr-no-randomize";
+            "_build/default/bench/bench.exe";
+            "-d";
+            "/dev/shm";
+            "--json";
+            "--output";
+            Fmt.str "%a" Fpath.pp tmp_container;
+          ]
     in
     (* Conditionally move the results to ?output_file *)
     let results_path =
@@ -98,8 +112,7 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
       | None -> tmp_host
     in
     let content =
-      Utils.merge_json repo.name commit
-        (Yojson.Basic.from_string (Utils.read_fpath results_path))
+      Utils.merge_json repo.name commit (Yojson.Basic.from_string output)
     in
     let () = Utils.write_fpath results_path content in
     match slack_path with Some p -> Some (p, content) | None -> None
